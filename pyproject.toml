@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ecgraphrag"
+version = "0.2.0"
+description = "Evidence-calibrated GraphRAG indexing, OpenRouter extraction, MultiHop-RAG evaluation and graph visualization"
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.31",
+  "pandas>=2.0",
+  "pyarrow>=14",
+  "networkx>=3.2",
+  "matplotlib>=3.8",
+  "sentence-transformers>=3.0",
+]
+
+[project.optional-dependencies]
+pdf = ["pypdf>=4"]
+visual = ["pyvis>=0.3.2"]
+notebook = ["jupyter>=1.0", "ipykernel>=6", "nbformat>=5"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+ecgraphrag = "ecgraphrag.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
