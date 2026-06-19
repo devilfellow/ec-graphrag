@@ -9,9 +9,8 @@ Evidence-calibrated GraphRAG pipeline for MultiHop-RAG: the project builds a kno
 
 ## Documentation
 
-- [Full project workflow and metric description](docs/PROJECT_DESCRIPTION.md)
 - [Default retrieval configuration](configs/retrieval_two_stage.json)
-- [Evaluation notebook](notebooks/evaluate_graphrag_vs_calibrated.ipynb)
+- [Metrics and ablation notebook](notebooks/run_dual_dataset_ablation.ipynb)
 
 Background references:
 
