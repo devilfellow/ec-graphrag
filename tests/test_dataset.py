@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ecgraphrag.dataset import _download, create_qa_splits, normalize_multihop_rag
+from ecgraphrag.dataset import _download, create_qa_splits, normalize_multihop_rag, normalize_musique_ans
 from ecgraphrag.storage import read_jsonl, write_jsonl
 
 
@@ -43,6 +43,21 @@ class DatasetDownloadTest(unittest.TestCase):
             documents, qa = normalize_multihop_rag(raw, limit_docs=1, limit_qa=1)
             self.assertEqual(documents[0]["id"], "gold")
             self.assertEqual(qa[0]["answer"], "Gold")
+
+    def test_musique_normalization_keeps_supporting_evidence_covered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            raw = Path(temp) / "musique_ans_dev.jsonl"
+            raw.write_text(
+                """{"id":"q1","question":"Who wrote the work connected to Beta?","answer":"Alice","paragraphs":[{"idx":0,"title":"Alpha","paragraph_text":"Alice wrote the Alpha work that is connected to Beta through a documented multihop relation.","is_supporting":true},{"idx":1,"title":"Distractor","paragraph_text":"This distractor paragraph has enough text to normalize but should not become gold evidence.","is_supporting":false}],"question_decomposition":[{"question":"Who wrote Alpha?","answer":"Alice"}]}""",
+                encoding="utf-8",
+            )
+            documents, qa = normalize_musique_ans(raw, limit_qa=1)
+            document_ids = {row["id"] for row in documents}
+            evidence_ids = {item["url"] for item in qa[0]["evidence"]}
+            self.assertEqual(len(qa), 1)
+            self.assertTrue(evidence_ids)
+            self.assertTrue(evidence_ids <= document_ids)
+            self.assertEqual(qa[0]["metadata"]["dataset"], "musique_ans")
 
     def test_qa_splits_are_reproducible_and_stratified(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

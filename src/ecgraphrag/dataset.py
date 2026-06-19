@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import random
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,8 @@ from .storage import write_jsonl, write_json
 MULTIHOP_REPO = "https://github.com/yixuantt/MultiHop-RAG"
 GITHUB_API_DATASET = "https://api.github.com/repos/yixuantt/MultiHop-RAG/contents/dataset"
 RAW_BASE = "https://raw.githubusercontent.com/yixuantt/MultiHop-RAG/main/dataset"
+MUSIQUE_REPO = "https://github.com/stonybrooknlp/musique"
+MUSIQUE_ANS_DEV_FILE_ID = "1TRXU68wveSehVbQrRRtWsUsFkKUF43QS"
 
 TEXT_KEYS = ["text", "content", "body", "article", "passage", "document", "news", "article_text"]
 TITLE_KEYS = ["title", "headline", "name"]
@@ -55,6 +58,87 @@ def download_multihop_rag_dataset(output_dir: Path, limit_docs: int | None = Non
     }
     write_json(output_dir / "dataset_manifest.json", manifest)
     return manifest
+
+
+def download_musique_ans_dataset(output_dir: Path, limit_qa: int | None = None) -> dict[str, Any]:
+    """Download MuSiQue-Ans dev and normalize it into the project QA format."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = output_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = raw_dir / "musique_ans_dev.jsonl"
+    if not raw_path.exists():
+        _download_google_drive_file(MUSIQUE_ANS_DEV_FILE_ID, raw_path)
+    docs, qa = normalize_musique_ans(raw_path, limit_qa=limit_qa)
+    write_jsonl(output_dir / "documents.jsonl", docs)
+    write_jsonl(output_dir / "qa.jsonl", qa)
+    manifest = {
+        "source_repo": MUSIQUE_REPO,
+        "source_file": "raw_data/musique_ans_dev.jsonl",
+        "documents": len(docs),
+        "qa": len(qa),
+        "evidence_coverage": _evidence_coverage(docs, qa),
+    }
+    write_json(output_dir / "dataset_manifest.json", manifest)
+    return manifest
+
+
+def normalize_musique_ans(raw_path: Path, limit_qa: int | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Normalize MuSiQue-Ans rows into document and QA rows."""
+    rows = _read_rows(raw_path)
+    selected_rows = rows[:limit_qa] if limit_qa else rows
+    documents_by_id: dict[str, dict[str, Any]] = {}
+    qa: list[dict[str, Any]] = []
+    for row_index, row in enumerate(selected_rows):
+        question_id = str(row.get("id") or f"musique:{row_index}")
+        evidence: list[dict[str, Any]] = []
+        for paragraph in _musique_paragraphs(row):
+            if not isinstance(paragraph, dict):
+                continue
+            text = str(paragraph.get("paragraph_text") or paragraph.get("text") or "").strip()
+            if len(text) < 30:
+                continue
+            title = str(paragraph.get("title") or paragraph.get("wikipedia_title") or f"paragraph-{paragraph.get('idx', len(documents_by_id))}")
+            paragraph_idx = paragraph.get("idx", paragraph.get("wikipedia_id", len(documents_by_id)))
+            doc_id = _musique_document_id(title, text, paragraph_idx)
+            documents_by_id.setdefault(doc_id, {
+                "id": doc_id,
+                "title": title,
+                "text": text,
+                "source": "musique_ans_dev.jsonl",
+                "metadata": {
+                    "id": doc_id,
+                    "title": title,
+                    "source": "musique_ans_dev",
+                    "question_id": question_id,
+                    "paragraph_idx": paragraph_idx,
+                    "is_supporting": bool(paragraph.get("is_supporting")),
+                },
+            })
+            if paragraph.get("is_supporting"):
+                evidence.append({
+                    "url": doc_id,
+                    "title": title,
+                    "paragraph_idx": paragraph_idx,
+                })
+        query = _musique_question(row)
+        answer = _musique_answer(row)
+        if not query or answer is None:
+            continue
+        qa.append({
+            "id": question_id,
+            "query": str(query),
+            "answer": str(answer),
+            "evidence": evidence,
+            "source": "musique_ans_dev.jsonl",
+            "metadata": {
+                "dataset": "musique_ans",
+                "answerable": row.get("answerable", True),
+                "hop_count": len(evidence),
+                "question_decomposition": _musique_decomposition(row),
+                "source_id": question_id,
+            },
+        })
+    return list(documents_by_id.values()), qa
 
 
 def normalize_multihop_rag(raw_dir: Path, limit_docs: int | None = None, limit_qa: int | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -156,6 +240,38 @@ def _download(url: str, target: Path) -> None:
             raise RuntimeError(f"Cannot resolve Git LFS URL: {url}")
         data = _read_url(media_url)
     target.write_bytes(data)
+
+
+def _download_google_drive_file(file_id: str, target: Path) -> None:
+    """Download a public Google Drive file without requiring gdown."""
+    base_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    request = Request(base_url, headers={"User-Agent": "ec-graphrag"})
+    with urlopen(request, timeout=120) as response:  # nosec - public dataset URL
+        data = response.read()
+        cookies = response.headers.get_all("Set-Cookie", [])
+    if not _looks_like_google_drive_interstitial(data):
+        target.write_bytes(data)
+        return
+    token = _google_drive_confirm_token(data)
+    if not token:
+        raise RuntimeError("Google Drive confirmation token was not found")
+    confirm_url = f"{base_url}&confirm={token}"
+    headers = {"User-Agent": "ec-graphrag"}
+    if cookies:
+        headers["Cookie"] = "; ".join(cookie.split(";", 1)[0] for cookie in cookies)
+    confirm_request = Request(confirm_url, headers=headers)
+    with urlopen(confirm_request, timeout=300) as response:  # nosec - public dataset URL
+        target.write_bytes(response.read())
+
+
+def _looks_like_google_drive_interstitial(data: bytes) -> bool:
+    return data[:512].lstrip().startswith(b"<!DOCTYPE html") or b"confirm=" in data[:8192]
+
+
+def _google_drive_confirm_token(data: bytes) -> str | None:
+    text = data.decode("utf-8", errors="ignore")
+    match = re.search(r"confirm=([0-9A-Za-z_]+)", text)
+    return match.group(1) if match else None
 
 
 def _read_url(url: str) -> bytes:
@@ -260,6 +376,46 @@ def _dedupe_documents(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _musique_document_id(title: str, text: str, paragraph_idx: Any) -> str:
+    import hashlib
+
+    value = f"{title}\n{paragraph_idx}\n{text}".encode("utf-8")
+    return "musique:" + hashlib.sha1(value).hexdigest()[:16]
+
+
+def _musique_paragraphs(row: dict[str, Any]) -> list[dict[str, Any]]:
+    paragraphs = row.get("paragraphs")
+    if isinstance(paragraphs, list):
+        return [item for item in paragraphs if isinstance(item, dict)]
+    contexts = row.get("contexts")
+    if isinstance(contexts, list):
+        return [item for item in contexts if isinstance(item, dict)]
+    return []
+
+
+def _musique_question(row: dict[str, Any]) -> Any:
+    return row.get("question") or row.get("composed_question_text") or row.get("question_text") or row.get("query_text")
+
+
+def _musique_answer(row: dict[str, Any]) -> Any:
+    return row.get("answer") if row.get("answer") is not None else row.get("answer_text")
+
+
+def _musique_decomposition(row: dict[str, Any]) -> list[Any]:
+    if isinstance(row.get("question_decomposition"), list):
+        return row["question_decomposition"]
+    if isinstance(row.get("decomposed_instances"), list):
+        return [
+            {
+                "question": item.get("question_text"),
+                "answer": item.get("answer_text"),
+            }
+            for item in row["decomposed_instances"]
+            if isinstance(item, dict)
+        ]
+    return []
+
+
 def create_qa_splits(
     qa_path: Path,
     output_dir: Path,
@@ -303,6 +459,7 @@ def create_qa_splits(
 def main() -> None:
     """Run dataset normalization and optional QA split creation from the CLI."""
     parser = argparse.ArgumentParser(prog="ecgraphrag.dataset")
+    parser.add_argument("--name", choices=["multihop_rag", "musique_ans"], default="multihop_rag")
     parser.add_argument("--output", type=Path, default=Path("data/multihop_rag"))
     parser.add_argument("--limit-docs", type=int)
     parser.add_argument("--limit-qa", type=int)
@@ -312,7 +469,10 @@ def main() -> None:
     if args.split_output:
         print(json.dumps(create_qa_splits(args.output / "qa.jsonl", args.split_output, args.seed), indent=2))
         return
-    manifest = download_multihop_rag_dataset(args.output, args.limit_docs, args.limit_qa)
+    if args.name == "musique_ans":
+        manifest = download_musique_ans_dataset(args.output, args.limit_qa)
+    else:
+        manifest = download_multihop_rag_dataset(args.output, args.limit_docs, args.limit_qa)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
 

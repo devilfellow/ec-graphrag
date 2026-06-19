@@ -5,11 +5,7 @@ Evidence-calibrated GraphRAG pipeline for MultiHop-RAG: the project builds a kno
 ## Limitations And Safety
 
 - LLM extraction and enrichment use OpenRouter and can incur API costs. Resume/cache is enabled for successful chunks, but uncached chunks are submitted to the model.
-- Keep `OPENROUTER_API_KEY` only in a local `.env`. Do not commit API keys or notebook outputs containing secrets.
 - The package requires Python `>=3.11`. For notebook work from Windows, prefer a WSL-based virtual environment and Jupyter kernel.
-- Retrieval metrics are evidence-document metrics, not generated-answer quality metrics.
-- HTML/PNG graph exports are auxiliary. Auditable outputs are stored as JSONL, Parquet, GraphML, metrics JSON, and manifest files.
-- If embedding or reranker models are unavailable, retrieval can fall back to deterministic lexical/hashed behavior unless strict model mode is enabled.
 
 ## Documentation
 

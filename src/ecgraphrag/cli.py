@@ -4,8 +4,13 @@ import argparse
 import json
 from pathlib import Path
 
-from .benchmark import load_retrieval_config, run_benchmark, tune_retrieval
-from .dataset import create_qa_splits, download_multihop_rag_dataset, normalize_multihop_rag
+from .benchmark import load_retrieval_config, run_benchmark, run_retrieval_ablation, tune_retrieval
+from .dataset import (
+    create_qa_splits,
+    download_multihop_rag_dataset,
+    download_musique_ans_dataset,
+    normalize_multihop_rag,
+)
 from .indexer import GraphRAGIndexer
 from .metrics import compare_baseline_calibrated
 from .retrieve import Retriever
@@ -18,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     dataset = subparsers.add_parser("dataset")
+    dataset.add_argument("--name", choices=["multihop_rag", "musique_ans"], default="multihop_rag")
     dataset.add_argument("--output", type=Path, default=Path("data/multihop_rag"))
     dataset.add_argument("--raw-dir", type=Path)
     dataset.add_argument("--limit-docs", type=int)
@@ -35,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     retrieve = subparsers.add_parser("retrieve")
     retrieve.add_argument("--index", type=Path, required=True)
     retrieve.add_argument("--query", required=True)
-    retrieve.add_argument("--mode", choices=["heuristic", "embedding", "hybrid", "two_stage"], default="two_stage")
+    retrieve.add_argument("--mode", choices=["heuristic", "embedding", "hybrid", "two_stage", "iterative"], default="two_stage")
     retrieve.add_argument("--weights", type=Path)
     retrieve.add_argument("--top-k", type=int, default=10)
     retrieve.add_argument("--max-hops", type=int, default=2)
@@ -46,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     metrics.add_argument("--index", type=Path, required=True)
     metrics.add_argument("--qa", type=Path, required=True)
     metrics.add_argument("--top-k", type=int, default=10)
-    metrics.add_argument("--mode", choices=["heuristic", "embedding", "hybrid", "two_stage"], default="two_stage")
+    metrics.add_argument("--mode", choices=["heuristic", "embedding", "hybrid", "two_stage", "iterative"], default="two_stage")
     metrics.add_argument("--limit", type=int)
     metrics.add_argument("--output", type=Path)
     metrics.add_argument("--config", type=Path)
@@ -64,6 +70,17 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--top-k", type=int, default=10)
     benchmark.add_argument("--limit", type=int)
     benchmark.add_argument("--output", type=Path)
+
+    ablation = subparsers.add_parser("ablation")
+    ablation.add_argument("--dataset-name", required=True)
+    ablation.add_argument("--data", type=Path, required=True)
+    ablation.add_argument("--index", type=Path, required=True)
+    ablation.add_argument("--enriched-index", type=Path, required=True)
+    ablation.add_argument("--output", type=Path, required=True)
+    ablation.add_argument("--top-k", type=int, default=10)
+    ablation.add_argument("--limit", type=int)
+    ablation.add_argument("--config", type=Path)
+    ablation.add_argument("--allow-failed-evidence", action="store_true")
 
     tune = subparsers.add_parser("tune-retrieval")
     tune.add_argument("--index", type=Path, required=True)
@@ -84,6 +101,8 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.command == "dataset":
         if args.raw_dir:
+            if args.name != "multihop_rag":
+                raise ValueError("--raw-dir is only supported for --name multihop_rag")
             docs, qa = normalize_multihop_rag(args.raw_dir, args.limit_docs, args.limit_qa)
             from .storage import write_jsonl, write_json
             args.output.mkdir(parents=True, exist_ok=True)
@@ -92,7 +111,10 @@ def main() -> None:
             manifest = {"source": str(args.raw_dir), "documents": len(docs), "qa": len(qa)}
             write_json(args.output / "dataset_manifest.json", manifest)
         else:
-            manifest = download_multihop_rag_dataset(args.output, args.limit_docs, args.limit_qa)
+            if args.name == "musique_ans":
+                manifest = download_musique_ans_dataset(args.output, args.limit_qa)
+            else:
+                manifest = download_multihop_rag_dataset(args.output, args.limit_docs, args.limit_qa)
         print(json.dumps(manifest, ensure_ascii=False, indent=2))
         return
     if args.command == "index":
@@ -138,6 +160,20 @@ def main() -> None:
             config=load_retrieval_config(args.config),
             top_k=args.top_k,
             limit=args.limit,
+        )
+        print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
+        return
+    if args.command == "ablation":
+        result = run_retrieval_ablation(
+            args.dataset_name,
+            args.data,
+            args.index,
+            args.enriched_index,
+            args.output,
+            config=load_retrieval_config(args.config),
+            top_k=args.top_k,
+            limit=args.limit,
+            strict_failed_evidence=not args.allow_failed_evidence,
         )
         print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
         return

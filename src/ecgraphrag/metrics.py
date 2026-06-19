@@ -277,7 +277,7 @@ def main() -> None:
     parser.add_argument("--index", type=Path, required=True)
     parser.add_argument("--qa", type=Path, required=True)
     parser.add_argument("--top-k", type=int, default=10)
-    parser.add_argument("--mode", default="two_stage", choices=["heuristic", "embedding", "hybrid", "two_stage"])
+    parser.add_argument("--mode", default="two_stage", choices=["heuristic", "embedding", "hybrid", "two_stage", "iterative"])
     parser.add_argument("--limit", type=int)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--config", type=Path)

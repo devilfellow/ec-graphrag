@@ -16,7 +16,7 @@ from ecgraphrag import text
 
 
 class EvidenceMetricsTest(unittest.TestCase):
-    def _index(self, root: Path) -> Path:
+    def _index(self, root: Path, include_inferred: bool = False) -> Path:
         index = root / "index"
         index.mkdir()
         documents = [
@@ -32,8 +32,21 @@ class EvidenceMetricsTest(unittest.TestCase):
             source_docs=["doc_gold"], text_unit_ids=["tu_gold"],
             evidence_text="Alpha causes Beta.", edge_text="Alpha causes Beta.",
             reliability=0.9,
+            generated_questions=["Which component produces the target result?"],
+            semantic_summary="Alpha production creates the Beta target result.",
+            importance=0.9,
         )
+        edges = [edge]
+        if include_inferred:
+            edges.append(Edge(
+                "edge_inferred", "Gamma", "Delta", "associated_with", "Gamma implies Delta",
+                source_docs=["doc_other"], text_unit_ids=["tu_other"],
+                evidence_text="Inferred from graph path.", edge_text="Gamma inferred bridge to Delta.",
+                reliability=0.5, evidence_type="inferred",
+            ))
         entities = [Entity("a", "Alpha", aliases=["A"]), Entity("b", "Beta")]
+        entities[0].enriched_description = "Alpha is an enriched entity description."
+        entities[0].category = "Component"
         reports = [
             CommunityReport(f"r{i}", f"c{i}", f"Report {i}", "Alpha Beta", [], ["edge_gold"], 0.9)
             for i in range(6)
@@ -42,8 +55,8 @@ class EvidenceMetricsTest(unittest.TestCase):
             ("documents", documents),
             ("text_units", units),
             ("entities", entities),
-            ("relationships", [edge]),
-            ("calibrated_edges", [edge]),
+            ("relationships", edges),
+            ("calibrated_edges", edges),
             ("community_reports", reports),
         ):
             export_table(index, name, [asdict(value) for value in values])
@@ -97,6 +110,48 @@ class EvidenceMetricsTest(unittest.TestCase):
             self.assertEqual(result["ranked_documents"][0]["id"], "doc_gold")
             self.assertEqual(result["context"], [])
 
+    def test_iterative_retrieval_uses_bridge_entities(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            index = root / "index"
+            index.mkdir()
+            documents = [
+                Document("doc_seed", "Green album", "Green was performed by Steve Hillage.", "source", {"id": "seed"}),
+                Document("doc_bridge", "Miquette Giraudy", "Miquette Giraudy is the spouse and partner of Steve Hillage.", "source", {"id": "bridge"}),
+                Document("doc_noise", "Green color", "Green is a color with many cultural associations.", "source", {"id": "noise"}),
+            ]
+            units = [
+                TextUnit("tu_seed", "doc_seed", documents[0].text, 0, 8),
+                TextUnit("tu_bridge", "doc_bridge", documents[1].text, 0, 10),
+                TextUnit("tu_noise", "doc_noise", documents[2].text, 0, 9),
+            ]
+            edges = [
+                Edge("e_seed", "Green", "Steve Hillage", "associated_with", "Green performer",
+                     source_docs=["doc_seed"], text_unit_ids=["tu_seed"], edge_text="Green performer Steve Hillage.", reliability=0.9),
+                Edge("e_bridge", "Miquette Giraudy", "Steve Hillage", "associated_with", "Spouse",
+                     source_docs=["doc_bridge"], text_unit_ids=["tu_bridge"], edge_text="Miquette Giraudy spouse Steve Hillage.", reliability=0.9),
+                Edge("e_noise", "Green", "Color", "associated_with", "Green color",
+                     source_docs=["doc_noise"], text_unit_ids=["tu_noise"], edge_text="Green color.", reliability=0.6),
+            ]
+            entities = [Entity("green", "Green"), Entity("steve", "Steve Hillage"), Entity("miquette", "Miquette Giraudy")]
+            reports = [CommunityReport("r1", "c1", "Report", "Green Steve Hillage", [], ["e_seed", "e_bridge"], 0.9)]
+            for name, values in (
+                ("documents", documents),
+                ("text_units", units),
+                ("entities", entities),
+                ("relationships", edges),
+                ("calibrated_edges", edges),
+                ("community_reports", reports),
+            ):
+                export_table(index, name, [asdict(value) for value in values])
+
+            retriever = Retriever(index, config=RetrievalConfig(use_dense=False, use_reranker=False, use_enrichment=False))
+            result = retriever.retrieve("Who is the spouse of the Green performer?", mode="iterative", top_k=2)
+            ranked_ids = [row["id"] for row in result["ranked_documents"]]
+            self.assertIn("doc_seed", ranked_ids)
+            self.assertIn("doc_bridge", ranked_ids)
+            self.assertIn("Steve Hillage", result["diagnostics"]["bridge_entities"])
+
     def test_two_stage_ignores_graph_enrichment_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             retriever = Retriever(
@@ -123,11 +178,71 @@ class EvidenceMetricsTest(unittest.TestCase):
             self.assertGreater(ranked[0]["features"]["enrichment"], 0)
             self.assertGreater(diagnostics["ranked_lists"], 4)
 
+    def test_granular_enrichment_flags_select_document_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            index = self._index(Path(temp), include_inferred=True)
+            cases = [
+                ("questions", RetrievalConfig(use_dense=False, use_reranker=False, use_generated_questions=True,
+                                              use_semantic_summaries=False, use_entity_enrichment=False,
+                                              use_inferred_edges=False, use_edge_importance=False,
+                                              use_contradiction_penalty=False)),
+                ("summaries", RetrievalConfig(use_dense=False, use_reranker=False, use_generated_questions=False,
+                                              use_semantic_summaries=True, use_entity_enrichment=False,
+                                              use_inferred_edges=False, use_edge_importance=False,
+                                              use_contradiction_penalty=False)),
+                ("entities", RetrievalConfig(use_dense=False, use_reranker=False, use_generated_questions=False,
+                                             use_semantic_summaries=False, use_entity_enrichment=True,
+                                             use_inferred_edges=False, use_edge_importance=False,
+                                             use_contradiction_penalty=False)),
+                ("inferred_edges", RetrievalConfig(use_dense=False, use_reranker=False, use_generated_questions=False,
+                                                   use_semantic_summaries=False, use_entity_enrichment=False,
+                                                   use_inferred_edges=True, use_edge_importance=False,
+                                                   use_contradiction_penalty=False)),
+            ]
+            for expected, config in cases:
+                retriever = Retriever(index, config=config)
+                _, diagnostics = retriever.rank_documents("target result", top_k=2)
+                self.assertEqual(diagnostics["enrichment_fields"], [expected])
+
+    def test_use_enrichment_false_disables_all_granular_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = RetrievalConfig(
+                use_dense=False, use_reranker=False, use_enrichment=False,
+                use_generated_questions=True, use_semantic_summaries=True,
+                use_entity_enrichment=True, use_inferred_edges=True,
+                use_edge_importance=True, use_contradiction_penalty=True,
+            )
+            retriever = Retriever(self._index(Path(temp), include_inferred=True), config=config)
+            _, diagnostics = retriever.rank_documents("Which component produces the target result?", top_k=2)
+            self.assertEqual(diagnostics["enrichment_fields"], [])
+            self.assertTrue(all(edge.evidence_type != "inferred" for edge in retriever.edges))
+
+    def test_importance_and_contradiction_features_are_independent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            index = self._index(Path(temp))
+            config = RetrievalConfig(
+                use_dense=False, use_reranker=False, use_generated_questions=False,
+                use_semantic_summaries=False, use_entity_enrichment=False,
+                use_inferred_edges=False, use_edge_importance=True,
+                use_contradiction_penalty=True,
+            )
+            retriever = Retriever(index, config=config)
+            retriever.edges[0].conflict_status = "contradiction"
+            retriever.document_edges["doc_gold"][0].conflict_status = "contradiction"
+            ranked, diagnostics = retriever.rank_documents("What does Alpha cause?", top_k=2)
+            self.assertEqual(diagnostics["enrichment_fields"], [])
+            self.assertGreater(ranked[0]["features"]["importance"], 0)
+            self.assertLess(ranked[0]["features"]["contradiction_penalty"], 0)
+
     def test_query_decomposition_keeps_full_query_and_clauses(self) -> None:
         query = "Which company was reported by Fortune and which product was described by TechCrunch?"
         parts = decompose_query(query, max_subqueries=4)
         self.assertEqual(parts[0], query)
         self.assertGreaterEqual(len(parts), 2)
+
+    def test_query_decomposition_does_not_duplicate_unsplit_question(self) -> None:
+        query = "Who is the spouse of the Green performer?"
+        self.assertEqual(decompose_query(query), [query])
 
     def test_semantic_similarity_falls_back_when_transformers_rejects_keras(self) -> None:
         module = types.ModuleType("sentence_transformers")

@@ -34,11 +34,22 @@ class RetrievalConfig:
     use_dense: bool = True
     use_reranker: bool = True
     use_graph: bool = False
+    use_graph_expansion: bool = False
     use_enrichment: bool = True
+    use_generated_questions: bool = True
+    use_semantic_summaries: bool = True
+    use_entity_enrichment: bool = True
+    use_inferred_edges: bool = True
+    use_edge_importance: bool = True
+    use_contradiction_penalty: bool = True
     strict_models: bool = False
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     abstention_threshold: float = 0.30
+    graph_expansion_seed_k: int = 10
+    iterative_seed_k: int = 5
+    iterative_bridge_k: int = 8
+    iterative_bridge_weight: float = 1.50
     weights: dict[str, float] = field(default_factory=lambda: {
         "rrf": 0.45,
         "bm25": 0.20,
@@ -47,8 +58,11 @@ class RetrievalConfig:
         "coverage": 0.07,
         "metadata": 0.02,
         "graph": 0.01,
+        "graph_expansion": 0.08,
         "enrichment": 0.06,
         "reliability": 0.01,
+        "importance": 0.02,
+        "contradiction_penalty": 0.04,
     })
 
     @classmethod
@@ -82,6 +96,8 @@ class Retriever:
         self.config = config or RetrievalConfig.from_path(weights_path)
         edges_file = "calibrated_edges.jsonl" if calibrated else "relationships.jsonl"
         self.edges = [Edge(**row) for row in read_jsonl(index_path / edges_file)]
+        if not self._uses_inferred_edges():
+            self.edges = [edge for edge in self.edges if edge.evidence_type != "inferred"]
         if not calibrated:
             for edge in self.edges:
                 edge.reliability = 1.0
@@ -109,6 +125,14 @@ class Retriever:
             if not any(key in values for key in asdict(RetrievalConfig())):
                 self.hybrid_weights.update(values)
 
+    def _uses_enrichment(self, flag: str) -> bool:
+        """Return whether a specific enrichment signal is enabled."""
+        return bool(self.config.use_enrichment and getattr(self.config, flag))
+
+    def _uses_inferred_edges(self) -> bool:
+        """Return whether inferred edges should be visible to retrieval."""
+        return bool(self.config.use_enrichment and self.config.use_inferred_edges)
+
     def retrieve(
         self,
         query: str,
@@ -118,10 +142,12 @@ class Retriever:
         token_budget: int = 1200,
     ) -> dict[str, Any]:
         """Retrieve ranked context for a query using the selected mode."""
-        if mode not in {"heuristic", "embedding", "hybrid", "two_stage"}:
-            raise ValueError("mode must be heuristic, embedding, hybrid, or two_stage")
+        if mode not in {"heuristic", "embedding", "hybrid", "two_stage", "iterative"}:
+            raise ValueError("mode must be heuristic, embedding, hybrid, two_stage, or iterative")
         if mode == "two_stage":
             return self._retrieve_two_stage(query, top_k, max_hops, token_budget)
+        if mode == "iterative":
+            return self._retrieve_iterative(query, top_k, max_hops, token_budget)
         intent = _intent(query)
         candidates = self._edge_candidates(query, intent, mode)
         candidates.extend(self._path_candidates(query, intent, mode, max_hops))
@@ -142,6 +168,183 @@ class Retriever:
             "tokens_used": sum(item.token_count for item in selected),
             "context": [asdict(item) for item in selected],
         }
+
+    def _retrieve_iterative(
+        self,
+        query: str,
+        top_k: int,
+        max_hops: int,
+        token_budget: int,
+    ) -> dict[str, Any]:
+        """Retrieve documents with bridge-entity follow-up queries."""
+        started = time.perf_counter()
+        initial_ranked, initial_diagnostics = self.rank_documents(query, top_k=max(top_k, self.config.iterative_seed_k))
+        bridge_entities = self._bridge_entities(query, initial_ranked[: self.config.iterative_seed_k])
+        relation_hints = _relation_hints(query)
+        bridge_queries = self._bridge_queries(query, bridge_entities, relation_hints)
+        ranked_by_query: list[tuple[str, list[dict[str, Any]], dict[str, Any], float]] = [
+            (query, initial_ranked, initial_diagnostics, 1.0)
+        ]
+        for bridge_entity, bridge_query in bridge_queries:
+            ranked, diagnostics = self.rank_documents(bridge_query, top_k=max(top_k, self.config.candidate_k))
+            ranked = [
+                row for row in ranked
+                if self._document_mentions_entity(row["id"], bridge_entity)
+            ]
+            ranked_by_query.append((bridge_query, ranked, diagnostics, self.config.iterative_bridge_weight))
+        merged = self._merge_iterative_rankings(ranked_by_query, top_k)
+        ranked_ms = (time.perf_counter() - started) * 1000
+        document_context = self._pack_document_context(query, merged, token_budget)
+        remaining = max(0, token_budget - sum(item.token_count for item in document_context))
+        graph_context: list[Candidate] = []
+        if remaining:
+            intent = _intent(query)
+            graph_candidates = self._path_candidates(query, intent, "heuristic", max_hops)
+            graph_candidates.extend(self._report_candidates(query, intent, "heuristic"))
+            graph_context = _select_under_budget(
+                graph_candidates,
+                top_k=4,
+                token_budget=remaining,
+                kind_limits={"report": 2, "path": 2},
+            )
+        context = document_context + graph_context
+        diagnostics = {
+            "initial": initial_diagnostics,
+            "bridge_entities": bridge_entities[: self.config.iterative_bridge_k],
+            "relation_hints": relation_hints,
+            "bridge_queries": [query for _, query in bridge_queries],
+            "query_count": len(ranked_by_query),
+            "rank_documents_ms": round(ranked_ms, 3),
+            "total_ms": round((time.perf_counter() - started) * 1000, 3),
+        }
+        return {
+            "query": query,
+            "mode": "iterative",
+            "calibrated": self.calibrated,
+            "intent": _intent(query),
+            "token_budget": token_budget,
+            "tokens_used": sum(item.token_count for item in context),
+            "ranked_documents": merged,
+            "abstained": not merged or merged[0]["score"] < self.config.abstention_threshold,
+            "context": [asdict(item) for item in context],
+            "diagnostics": diagnostics,
+        }
+
+    def _bridge_entities(self, query: str, ranked_documents: list[dict[str, Any]]) -> list[str]:
+        """Select graph entities from seed documents as bridge query terms."""
+        query_tokens = set(content_tokens(query))
+        scores: defaultdict[str, float] = defaultdict(float)
+        labels: dict[str, str] = {}
+        for row in ranked_documents:
+            document = self.document_map.get(row["id"])
+            title_tokens = set(content_tokens(document.title if document else row.get("title", "")))
+            if len(title_tokens) == 1 and title_tokens <= query_tokens:
+                continue
+            document_score = float(row.get("score", 0.0))
+            for edge in self.document_edges[row["id"]]:
+                edge_match = lexical_similarity(query, edge.edge_text or edge.description or "")
+                for title in (edge.source, edge.target):
+                    key = title.casefold()
+                    if _entity_in_query(key, query_tokens):
+                        continue
+                    tokens = content_tokens(title)
+                    if not tokens or len(tokens) > 6:
+                        continue
+                    entity = self.entity_map.get(key)
+                    type_factor = _bridge_entity_type_factor(query_tokens, entity, tokens)
+                    labels.setdefault(key, title)
+                    scores[key] = max(
+                        scores[key],
+                        document_score * _reliability_factor(edge.reliability) * (0.25 + edge_match) * type_factor,
+                    )
+        return [
+            labels[key]
+            for key, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+        ]
+
+    def _bridge_queries(
+        self,
+        query: str,
+        bridge_entities: list[str],
+        relation_hints: list[str],
+    ) -> list[tuple[str, str]]:
+        """Build follow-up queries for iterative multi-hop retrieval."""
+        queries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        hint = relation_hints[0] if relation_hints else query
+        for entity in bridge_entities:
+            candidate = f"{entity} {hint}".strip()
+            if candidate and candidate not in seen:
+                queries.append((entity, candidate))
+                seen.add(candidate)
+            if len(queries) >= self.config.iterative_bridge_k:
+                return queries
+        return queries
+
+    def _document_mentions_entity(self, document_id: str, entity: str) -> bool:
+        """Return whether a document text or graph edges mention a bridge entity."""
+        entity_tokens = set(content_tokens(entity))
+        if not entity_tokens:
+            return False
+        document = self.document_map.get(document_id)
+        units = self.document_units.get(document_id, [])
+        document_tokens = set(content_tokens(_document_search_text(document, units))) if document else set()
+        if entity_tokens <= document_tokens:
+            return True
+        for edge in self.document_edges[document_id]:
+            if entity.casefold() in {edge.source.casefold(), edge.target.casefold()}:
+                return True
+        return False
+
+    def _merge_iterative_rankings(
+        self,
+        ranked_by_query: list[tuple[str, list[dict[str, Any]], dict[str, Any], float]],
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        """Merge initial and bridge-query rankings with weighted RRF."""
+        by_document: dict[str, dict[str, Any]] = {}
+        scores: defaultdict[str, float] = defaultdict(float)
+        query_hits: defaultdict[str, list[str]] = defaultdict(list)
+        for query, ranked, _diagnostics, weight in ranked_by_query:
+            for rank, row in enumerate(ranked[: self.config.candidate_k], start=1):
+                document_id = row["id"]
+                scores[document_id] += weight / (self.config.rrf_k + rank)
+                query_hits[document_id].append(query)
+                if document_id not in by_document or row.get("score", 0.0) > by_document[document_id].get("score", 0.0):
+                    by_document[document_id] = dict(row)
+        if not scores:
+            return []
+        maximum = max(scores.values())
+        rows = []
+        for document_id, row in by_document.items():
+            merged = dict(row)
+            merged["score"] = round(scores[document_id] / maximum, 6)
+            merged.setdefault("features", {})
+            merged["features"] = {**merged["features"], "iterative_rrf": merged["score"]}
+            merged["matched_queries"] = query_hits[document_id]
+            rows.append(merged)
+        ranked_all = sorted(rows, key=lambda row: (-row["score"], row["id"]))
+        ranked = ranked_all[:top_k]
+        initial_seed_ids = [
+            row["id"]
+            for row in (ranked_by_query[0][1][:1] if ranked_by_query else [])
+        ]
+        selected_ids = {row["id"] for row in ranked}
+        for document_id in initial_seed_ids:
+            if document_id in selected_ids or document_id not in by_document:
+                continue
+            protected = next((row for row in ranked_all if row["id"] == document_id), None)
+            if not protected:
+                continue
+            if len(ranked) >= top_k:
+                ranked[-1] = protected
+            else:
+                ranked.append(protected)
+            selected_ids = {row["id"] for row in ranked}
+        for rank, row in enumerate(ranked, start=1):
+            row["rank"] = rank
+            row["document_ids"] = [row["id"]]
+        return ranked
 
     def _retrieve_two_stage(
         self,
@@ -203,8 +406,11 @@ class Retriever:
             "dense": 0.0,
             "metadata": 0.0,
             "graph": 0.0,
+            "graph_expansion": 0.0,
             "enrichment": 0.0,
             "reliability": 0.0,
+            "importance": 0.0,
+            "contradiction_penalty": 0.0,
             "clause_scores": [],
         })
         ranked_lists = 0
@@ -246,7 +452,7 @@ class Retriever:
                         scores[document_id]["metadata"] = max(scores[document_id]["metadata"], value)
                     elif field_name == "graph":
                         scores[document_id]["graph"] = max(scores[document_id]["graph"], value)
-                    elif field_name in {"questions", "summaries", "entities"}:
+                    elif field_name in {"questions", "summaries", "entities", "inferred_edges"}:
                         scores[document_id]["enrichment"] = max(scores[document_id]["enrichment"], value)
                     clause_best[document_id] = max(clause_best[document_id], value)
             for document in self.documents:
@@ -261,6 +467,8 @@ class Retriever:
             features["coverage"] = coverage
             features["metadata"] = max(features["metadata"], metadata_match)
             features["reliability"] = self._document_reliability(document.id) if self.calibrated else 0.0
+            features["importance"] = self._document_importance(document.id)
+            features["contradiction_penalty"] = self._document_contradiction_penalty(document.id)
             features["rrf"] /= maximum_rrf
             features["reranker"] = 0.0
             candidates.append({
@@ -270,6 +478,13 @@ class Retriever:
                 "features": features,
                 "best_snippet": _best_snippet(query, self.document_units[document.id], document.text),
             })
+
+        graph_expansion_scores = (
+            self._document_graph_expansion_scores(query, candidates)
+            if self.config.use_graph_expansion else {}
+        )
+        for row in candidates:
+            row["features"]["graph_expansion"] = graph_expansion_scores.get(row["id"], 0.0)
 
         first_stage = sorted(
             candidates,
@@ -299,6 +514,7 @@ class Retriever:
             "enrichment_fields": [
                 name for name, texts, _ in enrichment_fields if any(texts)
             ],
+            "graph_expansion": self.config.use_graph_expansion,
             "embedding_backend": semantic_backend(),
             "reranker_backend": reranker_backend,
         }
@@ -340,8 +556,9 @@ class Retriever:
         parts: list[str] = []
         for edge in self.document_edges[document_id]:
             parts.append(edge.edge_text)
-            parts.extend(edge.generated_questions[:2])
-            if edge.semantic_summary:
+            if self._uses_enrichment("use_generated_questions"):
+                parts.extend(edge.generated_questions[:2])
+            if self._uses_enrichment("use_semantic_summaries") and edge.semantic_summary:
                 parts.append(edge.semantic_summary)
         return " ".join(parts)
 
@@ -350,15 +567,23 @@ class Retriever:
         questions: list[str] = []
         summaries: list[str] = []
         entities: list[str] = []
+        inferred_edges: list[str] = []
         for document in self.documents:
             document_questions: list[str] = []
             document_summaries: list[str] = []
+            document_inferred: list[str] = []
             entity_titles: set[str] = set()
             for edge in self.document_edges[document.id]:
-                document_questions.extend(edge.generated_questions)
-                if edge.semantic_summary:
+                if self._uses_enrichment("use_generated_questions"):
+                    document_questions.extend(edge.generated_questions)
+                if self._uses_enrichment("use_semantic_summaries") and edge.semantic_summary:
                     document_summaries.append(edge.semantic_summary)
-                entity_titles.update((edge.source, edge.target))
+                if self._uses_inferred_edges() and edge.evidence_type == "inferred":
+                    document_inferred.append(edge.edge_text)
+                    if self._uses_enrichment("use_semantic_summaries") and edge.semantic_summary:
+                        document_inferred.append(edge.semantic_summary)
+                if self._uses_enrichment("use_entity_enrichment"):
+                    entity_titles.update((edge.source, edge.target))
             entity_parts: list[str] = []
             for title in entity_titles:
                 entity = self.entity_map.get(title.casefold())
@@ -367,11 +592,17 @@ class Retriever:
             questions.append(" ".join(document_questions))
             summaries.append(" ".join(document_summaries))
             entities.append(" ".join(part for part in entity_parts if part))
-        return [
-            ("questions", questions, 0.35),
-            ("summaries", summaries, 0.20),
-            ("entities", entities, 0.10),
-        ]
+            inferred_edges.append(" ".join(document_inferred))
+        fields: list[tuple[str, list[str], float]] = []
+        if self._uses_enrichment("use_generated_questions"):
+            fields.append(("questions", questions, 0.35))
+        if self._uses_enrichment("use_semantic_summaries"):
+            fields.append(("summaries", summaries, 0.20))
+        if self._uses_enrichment("use_entity_enrichment"):
+            fields.append(("entities", entities, 0.10))
+        if self._uses_inferred_edges():
+            fields.append(("inferred_edges", inferred_edges, 0.18))
+        return fields
 
     def _document_reliability(self, document_id: str) -> float:
         """Average reliability of non-inferred edges attached to a document."""
@@ -380,6 +611,72 @@ class Retriever:
             return 0.0
         return sum(edge.reliability for edge in edges) / len(edges)
 
+    def _document_importance(self, document_id: str) -> float:
+        """Average edge importance for a document."""
+        if not self._uses_enrichment("use_edge_importance"):
+            return 0.0
+        edges = self.document_edges[document_id]
+        if not edges:
+            return 0.0
+        return sum(edge.importance for edge in edges) / len(edges)
+
+    def _document_contradiction_penalty(self, document_id: str) -> float:
+        """Return a negative score proportional to contradiction density."""
+        if not self._uses_enrichment("use_contradiction_penalty"):
+            return 0.0
+        edges = self.document_edges[document_id]
+        if not edges:
+            return 0.0
+        contradictions = sum(edge.conflict_status == "contradiction" for edge in edges)
+        return -(contradictions / len(edges))
+
+    def _document_graph_expansion_scores(
+        self,
+        query: str,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, float]:
+        """Score documents connected through non-query graph entities from top seeds."""
+        if not self.document_edges:
+            return {}
+        seed_rows = sorted(
+            candidates,
+            key=lambda row: (
+                -_weighted_score(row["features"], self.config.weights, exclude={"reranker", "graph_expansion"}),
+                row["id"],
+            ),
+        )[: max(1, self.config.graph_expansion_seed_k)]
+        query_tokens = set(content_tokens(query))
+        bridge_weights: defaultdict[str, float] = defaultdict(float)
+        for row in seed_rows:
+            seed_score = _weighted_score(
+                row["features"],
+                self.config.weights,
+                exclude={"reranker", "graph_expansion"},
+            )
+            for entity in self._document_entity_titles(row["id"]):
+                if _entity_in_query(entity, query_tokens):
+                    continue
+                bridge_weights[entity] = max(bridge_weights[entity], seed_score)
+        if not bridge_weights:
+            return {}
+        raw_scores = {
+            document.id: sum(bridge_weights[entity] for entity in self._document_entity_titles(document.id))
+            for document in self.documents
+        }
+        maximum = max(raw_scores.values(), default=0.0)
+        if maximum <= 0:
+            return {}
+        return {document_id: value / maximum for document_id, value in raw_scores.items()}
+
+    def _document_entity_titles(self, document_id: str) -> set[str]:
+        """Return normalized graph entity titles attached to a document."""
+        titles: set[str] = set()
+        for edge in self.document_edges[document_id]:
+            for title in (edge.source, edge.target):
+                if len(content_tokens(title)) >= 1:
+                    titles.add(title.casefold())
+        return titles
+
     def _edge_candidates(self, query: str, intent: str, mode: str) -> list[Candidate]:
         """Build edge candidates for non-two-stage retrieval context."""
         result = []
@@ -387,9 +684,13 @@ class Retriever:
         semantic = semantic_similarity_scores(query, texts)
         for edge, text, bm25, embedding in zip(self.edges, texts, bm25_scores(query, texts), semantic):
             utility, features = self._utility(query, text, intent, edge.useful_for, mode, bm25, embedding)
-            question_boost = _question_boost(query, edge.generated_questions)
-            importance_factor = 0.8 + 0.2 * edge.importance
-            score = utility * _reliability_factor(edge.reliability) * importance_factor + question_boost
+            question_boost = (
+                _question_boost(query, edge.generated_questions)
+                if self._uses_enrichment("use_generated_questions") else 0.0
+            )
+            importance_factor = 0.8 + 0.2 * edge.importance if self._uses_enrichment("use_edge_importance") else 1.0
+            contradiction_factor = 0.75 if self._uses_enrichment("use_contradiction_penalty") and edge.conflict_status == "contradiction" else 1.0
+            score = utility * _reliability_factor(edge.reliability) * importance_factor * contradiction_factor + question_boost
             result.append(Candidate(
                 edge.id, "edge", text, edge.reliability, utility,
                 score, estimate_tokens(text), [edge.id],
@@ -515,14 +816,15 @@ class Retriever:
     def _edge_retrieval_text(self, edge: Edge) -> str:
         """Build retrieval text for an edge and its connected enriched entities."""
         entity_parts: list[str] = []
-        for title in (edge.source, edge.target):
-            entity = self.entity_map.get(title.casefold())
-            if entity:
-                entity_parts.extend([entity.enriched_description, " ".join(entity.aliases), entity.category])
+        if self._uses_enrichment("use_entity_enrichment"):
+            for title in (edge.source, edge.target):
+                entity = self.entity_map.get(title.casefold())
+                if entity:
+                    entity_parts.extend([entity.enriched_description, " ".join(entity.aliases), entity.category])
         return " ".join(
             part for part in (
                 edge.edge_text,
-                edge.semantic_summary,
+                edge.semantic_summary if self._uses_enrichment("use_semantic_summaries") else "",
                 edge.evidence_text,
                 " ".join(entity_parts),
             )
@@ -597,6 +899,7 @@ def decompose_query(query: str, max_subqueries: int = 4) -> list[str]:
     normalized = re.sub(r"\s+", " ", query).strip()
     if not normalized:
         return []
+    normalized_key = normalized.strip(" ,.?").casefold()
     parts = re.split(
         r"\s*(?:,?\s+(?:and|while|whereas|as well as|according to|as reported by)\s+|[;])\s*",
         normalized,
@@ -605,11 +908,93 @@ def decompose_query(query: str, max_subqueries: int = 4) -> list[str]:
     result = [normalized]
     for part in parts:
         part = part.strip(" ,.?")
-        if len(content_tokens(part)) >= 4 and part.casefold() != normalized.casefold():
+        if len(content_tokens(part)) >= 4 and part.casefold() != normalized_key:
             result.append(part)
         if len(result) >= max_subqueries:
             break
     return result
+
+
+_RELATION_HINTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("spouse", "wife", "husband", "married"), "spouse partner wife husband"),
+    (("partner",), "partner spouse collaborator"),
+    (("founded", "founder", "co-founded", "cofounder"), "founder founded co-founder"),
+    (("headquartered", "headquarters", "headquarter"), "headquarters headquartered location"),
+    (("employer", "employed", "worked"), "employer employed by organization"),
+    (("child", "children", "son", "daughter"), "child son daughter"),
+    (("mother", "father", "parent", "grandmother", "grandfather"), "parent mother father grandmother grandfather"),
+    (("owner", "owned", "owns"), "owner owned by owns"),
+    (("manufacturer", "manufactured", "maker"), "manufacturer maker produced by"),
+    (("distributed", "distributor"), "distributed distributor"),
+    (("located", "location", "province", "city", "country"), "located location city country province"),
+    (("border", "borders"), "border shares border"),
+    (("member", "members"), "member of organization group"),
+    (("succeeded", "successor", "preceded"), "succeeded successor preceded"),
+    (("performer", "performed", "artist", "singer", "actor"), "performer artist singer actor"),
+)
+
+_RELATION_GENERIC_TOKENS = {
+    "what", "which", "whose", "where", "when", "who", "whom", "name", "called",
+    "green", "person", "people", "entity", "object", "thing",
+}
+
+
+def _relation_hints(query: str) -> list[str]:
+    """Extract compact relation-oriented query hints for bridge retrieval."""
+    tokens = content_tokens(query)
+    token_set = set(tokens)
+    hints: list[str] = []
+    for triggers, phrase in _RELATION_HINTS:
+        if token_set & set(triggers):
+            hints.append(phrase)
+    residual = [
+        token for token in tokens
+        if token not in _RELATION_GENERIC_TOKENS and len(token) > 2
+    ][:5]
+    if residual:
+        hints.append(" ".join(residual))
+    result: list[str] = []
+    for hint in hints:
+        if hint and hint not in result:
+            result.append(hint)
+    return result[:4]
+
+
+def _bridge_entity_type_factor(
+    query_tokens: set[str],
+    entity: Entity | None,
+    title_tokens: list[str],
+) -> float:
+    """Weight bridge entities by relation-compatible coarse type."""
+    entity_type = " ".join(
+        part for part in (
+            getattr(entity, "type", ""),
+            getattr(entity, "category", ""),
+            getattr(entity, "description", ""),
+        )
+        if part
+    ).casefold()
+    if query_tokens & {"spouse", "wife", "husband", "partner", "performer", "artist", "singer", "actor"}:
+        if "person" in entity_type or "musician" in entity_type or "artist" in entity_type:
+            return 1.9
+        if len(title_tokens) == 1:
+            return 0.45
+        if any(kind in entity_type for kind in ("album", "lake", "location", "date", "city", "country")):
+            return 0.55
+    if query_tokens & {"headquartered", "headquarters", "employer", "company", "organization"}:
+        if any(kind in entity_type for kind in ("organization", "company", "institution", "agency", "business")):
+            return 1.7
+        if "person" in entity_type:
+            return 0.55
+    if query_tokens & {"where", "located", "location", "city", "country", "province"}:
+        if any(kind in entity_type for kind in ("location", "city", "country", "province", "place")):
+            return 1.5
+    return 1.0
+
+
+def _entity_in_query(entity: str, query_tokens: set[str]) -> bool:
+    entity_tokens = set(content_tokens(entity))
+    return bool(entity_tokens and entity_tokens <= query_tokens)
 
 
 def _document_search_text(document: Document, units: list[TextUnit]) -> str:

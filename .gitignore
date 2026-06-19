@@ -13,5 +13,6 @@ data/multihop_rag/raw/
 *.parquet
 *.egg-info/
 .ipynb_checkpoints/
+notebooks/executed/
 
 /lib/
